@@ -263,6 +263,9 @@ where
     if args.first().is_some_and(|value| value == "export-fin") {
         return run_export_fin(&args, stdout, stderr);
     }
+    if args.first().is_some_and(|value| value == "manuscript-xml") {
+        return run_manuscript_xml(&args, stdout);
+    }
     if args
         .first()
         .is_some_and(|value| value == "validate-kipo-xml")
@@ -2461,6 +2464,15 @@ fn run_export_kipo_xml<O: Write, E: Write>(args: &[String], stdout: &mut O, _std
         match args[index].as_str() {
             "--document-id" => options.document_id = value.clone(),
             "--keaps-version" => options.keaps_version = value.clone(),
+            // `--layout nk630`: 통합명세서작성기 6.30 제출파일과 같은 줄 배치 · keapsVersion 5.5.
+            "--layout" => match value.as_str() {
+                "nk630" => {
+                    options.layout = hlt_core::XmlLayout::Nk630;
+                    options.keaps_version = "5.5".into();
+                }
+                "seoan" => options.layout = hlt_core::XmlLayout::Seoan,
+                _ => return export_kipo_xml_usage(stdout),
+            },
             "--image-stem" => options.image_stem = value.clone(),
             "--page-count" => match value.parse::<u32>() {
                 Ok(parsed) if parsed >= 1 => options.page_count = Some(parsed),
@@ -2570,8 +2582,27 @@ struct AllowedMissing {
 fn required_heading_gate(
     input: &Path,
     allow: &[AllowedMissing],
+    nk630: bool,
 ) -> Result<(Vec<AllowedMissing>, Vec<String>), CoreError> {
-    let session = hlt_core::EditorSession::open(input)?;
+    let mut session = hlt_core::EditorSession::open(input)?;
+    session.set_target_nk630(nk630);
+    // NK-Editor 6.30 이 변환을 거부하는 오류(실측) — 그 작성기로 낼 문서면 제출파일을 만들지 않는다.
+    if nk630 {
+        let blocking: Vec<String> = session
+            .submission_checks()
+            .into_iter()
+            .filter(|issue| matches!(issue.code, Some("E-244" | "E-204" | "E-242" | "E-262")))
+            .map(|issue| format!("{} {}", issue.code.unwrap_or(""), issue.detail))
+            .collect();
+        if !blocking.is_empty() {
+            let mut error = CoreError::new(ErrorCode::StructureInvalid, "export_fin", false);
+            error
+                .details
+                .insert("reason".into(), "nk630_validation".into());
+            error.details.insert("issues".into(), blocking.join(" | "));
+            return Err(error);
+        }
+    }
     let missing = hlt_core::missing_required_headings(&session.paragraphs());
     let refused: Vec<&str> = missing
         .iter()
@@ -2643,6 +2674,67 @@ fn validate_kipo_xml_usage<O: Write>(stdout: &mut O) -> u8 {
 }
 
 /// KIPO 스키마 검증(통특기 제출파일 생성의 「XML 파일 검증」). 통과하지 않으면 결과를 실은 채 종료 코드로 알린다.
+/// 글 원고 → NK-Editor 6.30 제출 XML(+ 그림 `patNNNNN.tif` 복사). 이어서 `generate-hlt` 로 HLT,
+/// `export-fin --layout nk630` 으로 제출 세트를 만든다.
+/// `manuscript-xml <원고.txt> <출력 폴더> [--page-count N] [--document-id ID]`
+fn run_manuscript_xml<O: Write>(args: &[String], stdout: &mut O) -> u8 {
+    fn usage<O: Write>(stdout: &mut O) -> u8 {
+        let _ = writeln!(
+            stdout,
+            "usage: hlt-cli manuscript-xml <manuscript.txt> <out-dir> [--page-count <n>] [--document-id <id>]"
+        );
+        EXIT_USAGE
+    }
+    let (Some(input), Some(out_dir)) = (args.get(1), args.get(2)) else {
+        return usage(stdout);
+    };
+    let (mut page_count, mut document_id) = (1_u32, "0".to_string());
+    let mut rest = args[3..].iter();
+    while let Some(flag) = rest.next() {
+        match (flag.as_str(), rest.next()) {
+            ("--page-count", Some(v)) => match v.parse() {
+                Ok(n) if n >= 1 => page_count = n,
+                _ => return usage(stdout),
+            },
+            ("--document-id", Some(v)) => document_id = v.clone(),
+            _ => return usage(stdout),
+        }
+    }
+    let result = (|| -> Result<serde_json::Value, CoreError> {
+        let input = Path::new(input);
+        let (xml, files) = hlt_core::manuscript_path_to_kipo_xml(input, &document_id, page_count)?;
+        let out = Path::new(out_dir);
+        std::fs::create_dir_all(out)
+            .map_err(|_| CoreError::new(ErrorCode::IoError, "out_dir", false))?;
+        let stem = input
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("manuscript");
+        let xml_path = out.join(format!("{stem}.xml"));
+        std::fs::write(&xml_path, xml.as_bytes())
+            .map_err(|_| CoreError::new(ErrorCode::IoError, "write_xml", false))?;
+        let mut images = Vec::new();
+        for (name, source) in &files {
+            std::fs::copy(source, out.join(name))
+                .map_err(|_| CoreError::new(ErrorCode::IoError, "copy_image", false))?;
+            images.push(name.clone());
+        }
+        Ok(serde_json::json!({ "xml": xml_path.display().to_string(), "images": images }))
+    })();
+    match result {
+        Ok(value) => {
+            let _ = write_envelope(stdout, &success_envelope("manuscript-xml", value));
+            0
+        }
+        Err(error) => {
+            let envelope: CommandEnvelope<serde_json::Value> =
+                error_envelope("manuscript-xml", error);
+            let _ = write_envelope(stdout, &envelope);
+            EXIT_VERIFY_FAILED
+        }
+    }
+}
+
 fn run_validate_kipo_xml<O: Write>(args: &[String], stdout: &mut O) -> u8 {
     let (Some(input), Some("--schema-dir"), Some(dir), None) = (
         args.get(1),
@@ -2802,7 +2894,7 @@ fn write_output(path: &Path, bytes: &[u8], overwrite: bool) -> std::io::Result<(
 fn export_fin_usage<O: Write>(stdout: &mut O) -> u8 {
     let _ = writeln!(
         stdout,
-        "usage: hlt-cli export-fin <input.HLT> <absent-output.fin> --hlz-name <name.hlz> --app-date <YYYY-MM-DD> --app-time <stamp> [--image-time <YYYY:MM:DD HH:MM:SS>] [--schema-dir <Epasl/INCLUDE/Schema>] [--document-id <id>] [--page-count <n>] [--amendment <name.dta>=<amendment.xml>=<YYYY-MM-DD>]... [--allow-missing-heading <표제>=<사유>]... [--overwrite]"
+        "usage: hlt-cli export-fin <input.HLT> <absent-output.fin> --hlz-name <name.hlz> --app-date <YYYY-MM-DD> --app-time <stamp> [--image-time <YYYY:MM:DD HH:MM:SS>] [--schema-dir <Epasl/INCLUDE/Schema>] [--document-id <id>] [--page-count <n>] [--layout seoan|nk630] [--amendment <name.dta>=<amendment.xml>=<YYYY-MM-DD>]... [--allow-missing-heading <표제>=<사유>]... [--overwrite]"
     );
     EXIT_USAGE
 }
@@ -2835,6 +2927,15 @@ fn run_export_fin<O: Write, E: Write>(args: &[String], stdout: &mut O, _stderr: 
             "--image-time" => fin.image_time = value.clone(),
             "--document-id" => kipo.document_id = value.clone(),
             "--keaps-version" => kipo.keaps_version = value.clone(),
+            // `--layout nk630`: 통합명세서작성기 6.30 제출파일과 같은 줄 배치 · keapsVersion 5.5.
+            "--layout" => match value.as_str() {
+                "nk630" => {
+                    kipo.layout = hlt_core::XmlLayout::Nk630;
+                    kipo.keaps_version = "5.5".into();
+                }
+                "seoan" => kipo.layout = hlt_core::XmlLayout::Seoan,
+                _ => return export_fin_usage(stdout),
+            },
             "--image-stem" => kipo.image_stem = value.clone(),
             "--page-count" => match value.parse::<u32>() {
                 Ok(parsed) if parsed >= 1 => kipo.page_count = Some(parsed),
@@ -2887,7 +2988,11 @@ fn run_export_fin<O: Write, E: Write>(args: &[String], stdout: &mut O, _stderr: 
         let _ = write_envelope(stdout, &envelope);
         return EXIT_VERIFY_FAILED;
     }
-    let (allowed_missing, gate_warnings) = match required_heading_gate(input_path, &allow) {
+    let (allowed_missing, gate_warnings) = match required_heading_gate(
+        input_path,
+        &allow,
+        kipo.layout == hlt_core::XmlLayout::Nk630,
+    ) {
         Ok(value) => value,
         Err(error) => {
             let envelope: CommandEnvelope<FinExportResult> = error_envelope("export-fin", error);

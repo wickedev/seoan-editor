@@ -19,18 +19,22 @@ const TIFF_PIXEL_OFFSET_GRAY: u32 = 364;
 pub enum TiffPixels {
     Gray8,
     Rgb8,
+    /// 1비트 흑백(WhiteIsZero, 행마다 바이트 맞춤). 국내출원 도면(300dpi 1비트 G4 TIFF)을 그대로 지킨다 —
+    /// 제출 세트에서 G4 TIFF 로 다시 굽힌다(`export_fin::tiff_to_g4`). 8비트로 풀면 JPEG 로 나가 버린다.
+    Bilevel,
 }
 
 impl TiffPixels {
     fn samples(self) -> u32 {
         match self {
-            TiffPixels::Gray8 => 1,
+            TiffPixels::Gray8 | TiffPixels::Bilevel => 1,
             TiffPixels::Rgb8 => 3,
         }
     }
 
     fn photometric(self) -> u32 {
         match self {
+            TiffPixels::Bilevel => 0,
             TiffPixels::Gray8 => 1,
             TiffPixels::Rgb8 => 2,
         }
@@ -38,8 +42,16 @@ impl TiffPixels {
 
     fn pixel_offset(self) -> u32 {
         match self {
-            TiffPixels::Gray8 => TIFF_PIXEL_OFFSET_GRAY,
+            TiffPixels::Gray8 | TiffPixels::Bilevel => TIFF_PIXEL_OFFSET_GRAY,
             TiffPixels::Rgb8 => TIFF_PIXEL_OFFSET_RGB,
+        }
+    }
+
+    /// 한 줄 바이트 수.
+    fn row_bytes(self, width: u32) -> u64 {
+        match self {
+            TiffPixels::Bilevel => u64::from(width).div_ceil(8),
+            _ => u64::from(width) * u64::from(self.samples()),
         }
     }
 }
@@ -162,9 +174,9 @@ pub fn plan_hlt_images(
         let payload = payload_map
             .get(image.id.as_str())
             .ok_or_else(|| image_error("missing_payload"))?;
-        let decoded = flatten_on_white(
-            image::load_from_memory(payload).map_err(|_| image_error("decode"))?,
-        );
+        let bilevel = source_bilevel_dpi(payload);
+        let decoded =
+            flatten_on_white(image::load_from_memory(payload).map_err(|_| image_error("decode"))?);
         // 통특기는 원본의 색 모드를 보존한다 (PCT 저장본 그레이스케일, 옛 저장본 RGB).
         let gray = matches!(
             decoded.color(),
@@ -173,7 +185,9 @@ pub fn plan_hlt_images(
                 | image::ColorType::La8
                 | image::ColorType::La16
         );
-        let (mode, raster) = if gray {
+        let (mode, raster) = if bilevel.is_some() {
+            (TiffPixels::Bilevel, pack_bilevel(&decoded.to_luma8()))
+        } else if gray {
             (TiffPixels::Gray8, decoded.to_luma8().into_raw())
         } else {
             (TiffPixels::Rgb8, decoded.to_rgb8().into_raw())
@@ -183,12 +197,14 @@ pub fn plan_hlt_images(
             .object_count
             .checked_add(index as u32)
             .ok_or_else(|| image_error("image_code_overflow"))?;
-        let path = format!(r"C:\KIPONET\NKEDITOR\TEMP\SEOAN\pat{code:05}.jpg");
+        let ext = if bilevel.is_some() { "tif" } else { "jpg" };
+        let path = format!(r"C:\KIPONET\NKEDITOR\TEMP\SEOAN\pat{code:05}.{ext}");
         let secondary = match (image.secondary_width, image.secondary_height) {
             (Some(width), Some(height)) => Some((width, height)),
             _ => None,
         };
-        let record = build_hlt_image_record(
+        let record = build_hlt_image_record_dpi(
+            bilevel.unwrap_or(96),
             &path,
             pixel_width,
             pixel_height,
@@ -226,6 +242,68 @@ pub fn plan_hlt_images(
         object_count,
         images: objects,
     })
+}
+
+/// 원본이 1비트 TIFF 면 그 해상도(dpi, 없으면 300)를 돌려준다. 국내출원 도면 규격(별지 제17호: 300~400dpi
+/// 흑백 TIFF)이라 그대로 흑백으로 지킨다.
+fn source_bilevel_dpi(bytes: &[u8]) -> Option<u32> {
+    let little = match bytes.get(..4)? {
+        b"II*\0" => true,
+        b"MM\0*" => false,
+        _ => return None,
+    };
+    let u16_at = |at: usize| {
+        let b = bytes.get(at..at + 2)?;
+        Some(if little {
+            u16::from_le_bytes([b[0], b[1]])
+        } else {
+            u16::from_be_bytes([b[0], b[1]])
+        })
+    };
+    let u32_at = |at: usize| {
+        let b = bytes.get(at..at + 4)?;
+        Some(if little {
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+        } else {
+            u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+        })
+    };
+    let ifd = u32_at(4)? as usize;
+    let count = u16_at(ifd)? as usize;
+    let (mut bits, mut samples, mut xres) = (1_u32, 1_u32, None);
+    for k in 0..count {
+        let at = ifd + 2 + 12 * k;
+        let (tag, kind) = (u16_at(at)?, u16_at(at + 2)?);
+        let value = if kind == 3 {
+            u32::from(u16_at(at + 8)?)
+        } else {
+            u32_at(at + 8)?
+        };
+        match tag {
+            258 => bits = value,
+            277 => samples = value,
+            282 if kind == 5 => {
+                let off = value as usize;
+                let (num, den) = (u32_at(off)?, u32_at(off + 4)?.max(1));
+                xres = Some((num + den / 2) / den);
+            }
+            _ => {}
+        }
+    }
+    (bits == 1 && samples == 1).then(|| xres.filter(|d| *d > 0).unwrap_or(300))
+}
+
+/// 8비트 회색 → 1비트(WhiteIsZero: 비트 1 = 검정), 행마다 바이트 맞춤.
+fn pack_bilevel(gray: &image::GrayImage) -> Vec<u8> {
+    let (width, height) = gray.dimensions();
+    let row = width.div_ceil(8) as usize;
+    let mut out = vec![0_u8; row * height as usize];
+    for (x, y, pixel) in gray.enumerate_pixels() {
+        if pixel.0[0] < 128 {
+            out[y as usize * row + x as usize / 8] |= 0x80 >> (x % 8);
+        }
+    }
+    out
 }
 
 /// 투명도가 있는 그림을 흰 바탕에 합성한다(없으면 그대로).
@@ -267,24 +345,35 @@ pub fn build_tiff(
     pixels: &[u8],
     mode: TiffPixels,
 ) -> Result<Vec<u8>, CoreError> {
+    build_tiff_dpi(width, height, pixels, mode, 96)
+}
+
+/// `build_tiff` 에 해상도(dpi)를 정해 준다. 1비트 도면은 원본 300dpi 를 지켜야 쪽 배치 · 제출 크기가 맞다.
+pub fn build_tiff_dpi(
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    mode: TiffPixels,
+    dpi: u32,
+) -> Result<Vec<u8>, CoreError> {
     if width == 0 || height == 0 {
         return Err(image_error("zero_dimension"));
     }
     let pixel_offset = mode.pixel_offset();
-    let expected = u64::from(width)
+    let expected = mode
+        .row_bytes(width)
         .checked_mul(u64::from(height))
-        .and_then(|value| value.checked_mul(u64::from(mode.samples())))
         .ok_or_else(|| image_error("pixel_size_overflow"))?;
     if expected != pixels.len() as u64 || expected > u64::from(u32::MAX) {
         return Err(image_error("pixel_length"));
     }
     // 그레이스케일은 BitsPerSample 을 인라인 SHORT 로 적어 254바이트 배열이 없다.
     // 그래서 유리수/문자열 값이 6바이트 앞당겨지고 픽셀이 364 에서 시작한다(네이티브와 동일).
-    let gray = mode == TiffPixels::Gray8;
-    let bits = if gray {
-        (3_u16, 1_u32, 8_u32)
-    } else {
-        (3, 3, 254)
+    let gray = matches!(mode, TiffPixels::Gray8 | TiffPixels::Bilevel);
+    let bits = match mode {
+        TiffPixels::Bilevel => (3_u16, 1_u32, 1_u32),
+        TiffPixels::Gray8 => (3, 1, 8),
+        TiffPixels::Rgb8 => (3, 3, 254),
     };
     let (xres, yres, software, datetime, artist) = if gray {
         (254_u32, 262_u32, 270_u32, 300_u32, 320_u32)
@@ -329,7 +418,7 @@ pub fn build_tiff(
             push_u16(&mut out, value);
         }
     }
-    for value in [96_u32, 1, 96, 1] {
+    for value in [dpi, 1, dpi, 1] {
         push_u32(&mut out, value);
     }
     fixed_ascii(&mut out, b"seoan HLT\0", 30)?;
@@ -353,10 +442,35 @@ pub fn build_hlt_image_record(
     display_height: u32,
     secondary: Option<(u32, u32)>,
 ) -> Result<Vec<u8>, CoreError> {
+    build_hlt_image_record_dpi(
+        96,
+        path,
+        width,
+        height,
+        pixels,
+        mode,
+        display_width,
+        display_height,
+        secondary,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_hlt_image_record_dpi(
+    dpi: u32,
+    path: &str,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    mode: TiffPixels,
+    display_width: u32,
+    display_height: u32,
+    secondary: Option<(u32, u32)>,
+) -> Result<Vec<u8>, CoreError> {
     if !path.is_ascii() || path.len() + 1 > 260 {
         return Err(image_error("image_path"));
     }
-    let tiff = build_tiff(width, height, pixels, mode)?;
+    let tiff = build_tiff_dpi(width, height, pixels, mode, dpi)?;
     let tiff_len = u32::try_from(tiff.len()).map_err(|_| image_error("tiff_size"))?;
     let mut prefix = vec![0_u8; IMAGE_RECORD_PREFIX];
     put_u32(&mut prefix, 0, 128);

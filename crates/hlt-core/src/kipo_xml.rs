@@ -133,9 +133,13 @@ pub fn inspect_kipo_xml_path(path: &Path) -> Result<KipoXmlDocument, CoreError> 
     let invention_title = patent
         .first_descendant("invention-title")
         .map_or_else(String::new, |node| node.text().trim().to_string());
+    // NK-Editor 6.30(keapsVersion 5.5) 제출 XML 은 과제 표제 짝이 【해결하고자 하는 과제】다 —
+    // 그대로 읽어야 다시 낼 때 그 작성기의 E-244(배경 표제와 짝)에 걸리지 않는다.
+    let nk630 = root.attributes.get("keapsversion").map(String::as_str) == Some("5.5");
     let document = normalize_patent(
         patent,
         dialect,
+        nk630,
         source.clone(),
         source_sha256.clone(),
         input_encoding.clone(),
@@ -768,6 +772,7 @@ enum CellSlot<'a> {
 fn normalize_patent(
     patent: &XmlNode,
     dialect: KipoXmlDialect,
+    nk630: bool,
     source: String,
     source_sha256: String,
     encoding: String,
@@ -876,7 +881,14 @@ fn normalize_patent(
         builder.emit_section("【발명의 내용】");
         let mut emitted_subsection = false;
         for (tag, title) in [
-            ("tech-problem", "【해결하려는 과제】"),
+            (
+                "tech-problem",
+                if nk630 && dialect == KipoXmlDialect::PatentCafdoc {
+                    "【해결하고자 하는 과제】"
+                } else {
+                    "【해결하려는 과제】"
+                },
+            ),
             ("tech-solution", "【과제의 해결 수단】"),
             ("advantageous-effects", "【발명의 효과】"),
         ] {

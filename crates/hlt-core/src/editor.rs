@@ -46,6 +46,8 @@ pub struct EditorSession {
     pub cp949_substitutions: Vec<crate::Cp949Substitution>,
     /// 최종본(.fin)을 열었나 · 그 첫 판 문단(서식 구간까지 — 모델이 다 되면 찍는다). 보정 표시의 「보정 전」.
     from_final: bool,
+    /// 제출을 NK-Editor 6.30 으로 확인한다(그 판의 표제 짝 E-244 를 건다). `set_target_nk630` 으로 켠다.
+    target_nk630: bool,
     /// 연 제출파일에 서열목록 파일(st26sdosl.xml)이 들어 있었다 — 판독기는 【서열목록】을 되살리지 않으니 제출 전 점검이 알린다.
     package_sequence: bool,
     baseline: Option<Vec<EditorParagraph>>,
@@ -211,6 +213,11 @@ enum Cell {
 }
 
 impl EditorSession {
+    /// 제출 점검을 통합명세서작성기(NK-Editor 6.30) 기준으로 한다 — 그 판의 표제 짝(E-244)을 더 건다.
+    pub fn set_target_nk630(&mut self, on: bool) {
+        self.target_nk630 = on;
+    }
+
     pub fn open(source: &Path) -> Result<Self, CoreError> {
         let dir = tempfile::tempdir().map_err(|_| editor_error("workdir"))?;
         let first = dir.path().join("v0.HLT");
@@ -295,6 +302,7 @@ impl EditorSession {
             opened_numbers,
             cp949_substitutions: Vec::new(),
             from_final: package,
+            target_nk630: false,
             package_sequence,
             baseline: None,
             baseline_figures: Default::default(),
@@ -2161,6 +2169,7 @@ impl EditorSession {
                 .filter(|p| nonstandard_spacing(p.lspace))
                 .map(|p| p.id.clone())
                 .collect(),
+            target_nk630: self.target_nk630,
         };
         issues.extend(crate::format_checks(&paragraphs, &objects));
         if self.package_sequence

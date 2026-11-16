@@ -43,6 +43,20 @@ pub struct KipoExportOptions {
     /// 문단마다의 식별번호(`<p num>` · 문단 차례) — 서안으로 연 최종본은 HLT 에 식별번호를 싣지 않으니(생성기는
     /// 매달린 번호를 쓰지 않는다) 편집 세션이 든 번호를 여기로 넘긴다. HLT 에 식별번호가 있으면 그것을 쓴다.
     pub paragraph_numbers: Vec<Option<String>>,
+    /// 줄바꿈 꼴. `Seoan` 은 그동안의 꼴(요소마다 `\n`), `Nk630` 은 통합명세서작성기(NK-Editor 6.30,
+    /// 2025-10-01) 제출파일과 바이트로 같은 꼴이다 — `fixtures/official-nk630` 실측.
+    pub layout: XmlLayout,
+}
+
+/// 제출 XML 의 줄 배치.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum XmlLayout {
+    #[default]
+    Seoan,
+    /// NK-Editor 6.30: 여는 절 요소가 첫 문단과 같은 줄(`<technical-field><p …>`), 닫는 묶음은 앞 줄 끝에
+    /// 붙고(`</advantageous-effects></summary-of-invention>`), 머리 넉 줄 · 빈 줄 · 단독 여는 태그 줄만 CRLF,
+    /// 나머지는 LF, 마지막 `</KIPO>` 뒤 줄바꿈 없음, `<PatentCAFDOC>` 다음 빈 줄 하나.
+    Nk630,
 }
 
 impl Default for KipoExportOptions {
@@ -56,6 +70,7 @@ impl Default for KipoExportOptions {
             image_format: String::new(),
             number_by_id: false,
             paragraph_numbers: Vec::new(),
+            layout: XmlLayout::Seoan,
         }
     }
 }
@@ -428,7 +443,14 @@ pub fn export_kipo_xml(
             let section = sections
                 .last_mut()
                 .ok_or_else(|| export_error("no_section"))?;
-            let continues = numbered_by_id && paragraph.wipo_id.is_none_or(|id| id == 0);
+            // 한 목록의 문헌은 모두 같은 `<p>` 에 든다. 최종본 편집은 식별번호가 없는 줄만 잇고
+            // (보정 대조), 새 문서는 첫 문헌 뒤 줄을 전부 잇는다 — NK-Editor 6.30 제출파일 실측
+            // (fixtures/official-nk630 · 특허문헌 둘 = `<p num>` 하나).
+            let continues = if numbered_by_id {
+                paragraph.wipo_id.is_none_or(|id| id == 0)
+            } else {
+                section.body.ends_with("</p>\n")
+            };
             match section.body.strip_suffix("</p>\n") {
                 Some(open) if continues => section.body = format!("{open}{cited}</p>\n"),
                 _ => {
@@ -676,6 +698,9 @@ pub fn export_kipo_xml(
         xml.push_str(&format!("<drawings>\n{drawings}</drawings>\n"));
     }
     xml.push_str(&format!("</{}>\n</KIPO>", document_element(document)));
+    if options.layout == XmlLayout::Nk630 {
+        xml = nk630_layout(&xml);
+    }
 
     Ok(KipoExport {
         claims: claim_list,
@@ -688,6 +713,95 @@ pub fn export_kipo_xml(
         numbered_by_id,
         sequence_file: sequence.map(|(_, path)| path),
     })
+}
+
+/// 서안 꼴(요소마다 한 줄) → NK-Editor 6.30 제출파일 꼴. 글 내용은 건드리지 않고 줄 배치만 바꾼다.
+///
+/// 실측 규칙(시험 2건 + 실제 명세서 1건, 바이트 일치):
+/// - `<절>` 다음 줄이 `<p` 로 시작하면 한 줄로 붙인다(`<technical-field><p num="0001">…`).
+///   단 `description-of-drawings` · `reference-signs-list` · `summary` · `abstract-figure` · `drawings` 는 떼어 둔다.
+/// - 닫는 묶음 태그(`</summary-of-invention>` `</description>` `</citation-list>` `</claims>` `</abstract>`)는 바로 앞 줄 끝에 붙인다.
+/// - `<claims>` 아래 `<claim …>` 줄들은 그대로 두되 마지막 `</claim>` 뒤에 `</claims>` 를 붙인다.
+/// - 머리 넉 줄(선언 · `<KIPO>` · 문서 요소 · 빈 줄)과 한 줄 전체가 여는 태그뿐인 줄은 CRLF, 나머지는 LF.
+fn nk630_layout(xml: &str) -> String {
+    const KEEP_OPEN: [&str; 5] = [
+        "<description-of-drawings>",
+        "<reference-signs-list>",
+        "<summary>",
+        "<abstract-figure>",
+        "<drawings>",
+    ];
+    const GLUE_CLOSE: [&str; 6] = [
+        "</summary-of-invention>",
+        "</description>",
+        "</citation-list>",
+        "</claims>",
+        "</abstract>",
+        "</patent-literature>",
+    ];
+    // `</abstract>` 는 `</abstract-figure>` 뒤에서만 붙는다. 대표도가 없으면 `</summary>` 다음 줄에 혼자 선다.
+    let mut lines: Vec<String> = Vec::new();
+    let src: Vec<&str> = xml.split('\n').collect();
+    let mut i = 0;
+    while i < src.len() {
+        let line = src[i];
+        // 닫는 묶음: 앞 줄에 붙인다. 단 `</patent-literature>` 는 `</p>` 줄 뒤에서만 따로 선다(실측: 단독 줄).
+        if GLUE_CLOSE.contains(&line)
+            && line != "</patent-literature>"
+            && !(line == "</abstract>" && lines.last().is_some_and(|l| l == "</summary>"))
+            && let Some(last) = lines.last_mut()
+        {
+            last.push_str(line);
+            i += 1;
+            continue;
+        }
+        let is_open = line.starts_with('<')
+            && !line.starts_with("</")
+            && line.ends_with('>')
+            && !line.contains(' ')
+            && line.matches('<').count() == 1;
+        if is_open
+            && !KEEP_OPEN.contains(&line)
+            && line != "<description>"
+            && line != "<claims>"
+            && line != "<abstract>"
+            && line != "<citation-list>"
+            && line != "<summary-of-invention>"
+            && line != "<patent-literature>"
+            && line != "<non-patent-literature>"
+            && src.get(i + 1).is_some_and(|next| next.starts_with("<p "))
+        {
+            lines.push(format!("{line}{}", src[i + 1]));
+            i += 2;
+            continue;
+        }
+        lines.push(line.to_string());
+        i += 1;
+    }
+    // `<PatentCAFDOC …>` 다음 빈 줄.
+    if let Some(at) = lines.iter().position(|l| l.starts_with("<PatentCAFDOC")) {
+        lines.insert(at + 1, String::new());
+    }
+    let mut out = String::with_capacity(xml.len() + lines.len());
+    let last = lines.len().saturating_sub(1);
+    for (k, line) in lines.iter().enumerate() {
+        out.push_str(line);
+        if k == last {
+            break;
+        }
+        let lone_open = line.starts_with('<')
+            && !line.starts_with("</")
+            && line.ends_with('>')
+            && !line.contains(' ')
+            && line.matches('<').count() == 1;
+        // `<br/>` 로 끝난 줄(도면의 간단한 설명 · 부호의 설명 · 요약 안 줄바꿈)도 CRLF.
+        out.push_str(if k < 4 || lone_open || line.ends_with("<br/>") {
+            "\r\n"
+        } else {
+            "\n"
+        });
+    }
+    out
 }
 
 fn document_element(document: &InspectDocument) -> &'static str {

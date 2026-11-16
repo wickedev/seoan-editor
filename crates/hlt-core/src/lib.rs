@@ -34,6 +34,7 @@ mod import_opinion;
 mod inspect;
 mod kipo_rules;
 mod kipo_xml;
+mod manuscript;
 mod new_specification;
 mod numbering;
 mod package;
@@ -63,11 +64,11 @@ mod write;
 mod xliff;
 
 pub use align::{Alignment, Grade, Lang, Pair, Pin, SourcePara, align_inferred, sentences};
-pub use xliff::{Segment, align_xliff, read_xliff};
 pub use amend_marks::{
     AmendRow, AmendmentMarks, BasisHit, CitationIssue, CitationKind, ClaimBasis, FigureSignatures,
     ParagraphMark, PhraseBasis, amendment_basis, amendment_marks, amendment_marks_with,
-    amendment_table, claim_citation_issues, claim_parents, number_for_comparison, number_unnumbered,
+    amendment_table, claim_citation_issues, claim_parents, number_for_comparison,
+    number_unnumbered,
 };
 pub use baseline::docx_baseline;
 pub use batch::{BatchCheckRow, BatchRow, batch_generate_hlt, batch_submission_checks};
@@ -119,7 +120,7 @@ pub use export_fin::{
     sha256_hex,
 };
 pub use export_kipo::{
-    KipoExport, KipoExportImage, KipoExportOptions, display_units_to_mm,
+    KipoExport, KipoExportImage, KipoExportOptions, XmlLayout, display_units_to_mm,
     display_units_to_mm_import, export_kipo_xml, export_kipo_xml_path, is_import_convention,
 };
 pub use format_edit::{
@@ -150,8 +151,8 @@ pub use generate_characters::{
 };
 pub use generate_images::{
     GeneratedImageObject, GeneratedImagePayload, GeneratedImagePlan, TiffPixels,
-    build_hlt_image_record, build_rgb_tiff, build_tiff, load_hml_image_payloads_from_directory,
-    plan_hlt_images,
+    build_hlt_image_record, build_hlt_image_record_dpi, build_rgb_tiff, build_tiff, build_tiff_dpi,
+    load_hml_image_payloads_from_directory, plan_hlt_images,
 };
 pub use generate_profile::{
     AMENDMENT_DOCUMENT_TYPE, GenerationDialect, GenerationProfile, amendment_profile,
@@ -172,6 +173,9 @@ pub use import_opinion::{
 pub use inspect::{HltImagePayload, InspectDocument, InspectOptions, inspect_path};
 pub use kipo_rules::{CheckImage, CheckObjects, format_checks, missing_required_headings};
 pub use kipo_xml::{KipoXmlDialect, KipoXmlDocument, inspect_kipo_xml_path};
+pub use manuscript::{
+    Manuscript, manuscript_path_to_kipo_xml, manuscript_to_kipo_xml, parse_manuscript,
+};
 pub use new_specification::{SpecKind, SpecOptions, save_new_specification};
 pub use numbering::{number_paragraphs_as_new, plan_paragraph_numbers};
 pub use package::{hlt_from_original_fin, hlt_from_package};
@@ -224,5 +228,6 @@ pub use variable_edit::{
 };
 pub use verify::{VerifyResult, WindowProof, verify_path, verify_reader};
 pub use write::{WriteSummary, write_hlt};
+pub use xliff::{Segment, align_xliff, read_xliff};
 
 pub const CONTRACT_VERSION: u32 = 1;

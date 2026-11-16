@@ -9,6 +9,8 @@ fixtures/*
 !fixtures/phase2/
 fixtures/phase2/*
 !fixtures/phase2/*_probe.HLT.hex
+# 공식 NK-Editor 6.30 실물 출력(공개 가능한 시험 원고만)
+!fixtures/official-nk630/
 context/
 probes/
 # 빌드 · 도구 산출물

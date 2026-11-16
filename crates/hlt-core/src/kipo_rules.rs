@@ -26,6 +26,9 @@ pub struct CheckObjects {
     pub from_final: bool,
     /// 줄 간격이 표준(280%)이 아닌 본문 문단.
     pub nonstandard_spacing: BTreeSet<String>,
+    /// 제출을 통합명세서작성기(NK-Editor 6.30)로 확인할 문서 — 그 판의 표제 짝(E-244)을 건다.
+    /// 통특기(KipoEditor) 2026.11.05 판은 짝이 반대(【발명의 배경이 되는 기술】+【해결하려는 과제】)라 기본은 끈다.
+    pub target_nk630: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -327,6 +330,37 @@ pub fn format_checks(paragraphs: &[EditorParagraph], objects: &CheckObjects) -> 
         );
     }
 
+    // 1b. 옛 · 새 표제 짝(E-244). NK-Editor 6.30 실측: 【발명의 배경이 되는 기술】을 쓰면 과제 표제가
+    //     【해결하고자 하는 과제】여야 하고, 【배경기술】이면 【해결하려는 과제】여야 한다 — 섞으면
+    //     「%s 항목은 [배경기술] 태그를 기재하셔야 합니다」 등으로 변환을 거부한다(이름을 정규화하기 전에 본다).
+    //     통특기(KipoEditor) 2026.11.05 판 짝은 반대라(새 서식 = 배경이 되는 기술 + 해결하려는 과제)
+    //     NK-Editor 6.30 을 목표로 할 때만 건다.
+    if kind == Kind::Domestic && objects.target_nk630 {
+        let raw_of = |want: &[&str]| {
+            headings.iter().find(|(_, raw)| {
+                let name = raw.trim().replace("고안", "발명").replace(' ', "");
+                want.iter().any(|w| name == w.replace(' ', ""))
+            })
+        };
+        let new_background = raw_of(&["발명의 배경이 되는 기술"]);
+        let old_background = raw_of(&["배경기술"]);
+        let old_problem = raw_of(&["해결하고자 하는 과제"]);
+        let new_problem = raw_of(&["해결하려는 과제"]);
+        let mismatch = match (new_background, old_background, old_problem, new_problem) {
+            (Some(_), None, None, Some(problem)) => Some((problem, "해결하고자 하는 과제")),
+            (None, Some(_), Some(problem), None) => Some((problem, "해결하려는 과제")),
+            _ => None,
+        };
+        if let Some(((at, raw), want)) = mismatch {
+            push(
+                SubmitKind::Structure,
+                "E-244",
+                Some(&paragraphs[*at]),
+                format!("【{raw}】 — 배경 표제와 짝이 맞지 않습니다(NK-Editor 6.30 은 【{want}】)"),
+            );
+        }
+    }
+
     // 2. 번호 · 순서 · 묶음 · 필수 · 모르는 표제 · 【도 N】 뒤 빈 문단.
     let mut rank_seen = 0usize;
     let present = present_bases(&headings);
@@ -381,6 +415,28 @@ pub fn format_checks(paragraphs: &[EditorParagraph], objects: &CheckObjects) -> 
                 "E-249",
                 Some(stray),
                 format!("【{raw}】 바로 아래에는 하위 식별항목이 와야 합니다"),
+            );
+        }
+        // 내용을 받아야 할 표제 뒤에 내용 없이 바로 다음 표제(E-204, NK-Editor 6.30 실측:
+        // 「【도 1】」 다음 줄에 그림 없이 【도 2】). 묶음 표제(PARENTS)는 E-249 가 따로 본다.
+        if !PARENTS.contains(&base)
+            && !matches!(base, "청구범위" | "선행기술문헌")
+            && ((base == "도" && number.is_some())
+                || (base == "청구항" && number.is_some())
+                || (number.is_none() && ORDER.contains(&base)))
+            && body(at).iter().all(|q| !filled(q))
+            // 바로 뒤 표제가 이름 없는 【 】 · 따옴표 표제면 그쪽(E-211 · E-233)이 원인이다.
+            && !paragraphs.get(at + 1 + body(at).len()).is_some_and(|next| {
+                heading(&next.text).is_some_and(|n| {
+                    n.trim().is_empty() || n.contains(['\'', '"', '‘', '’', '“', '”'])
+                })
+            })
+        {
+            push(
+                SubmitKind::Structure,
+                "E-204",
+                Some(p),
+                format!("【{raw}】 — 내용 없이 다음 식별항목이 나옵니다"),
             );
         }
         if base == "도"
@@ -762,6 +818,46 @@ mod tests {
         let mut rows = good();
         edit(&mut rows);
         codes(&rows)
+    }
+
+    fn codes_nk630(rows: &[&str]) -> Vec<&'static str> {
+        let paragraphs = doc(rows);
+        let objects = CheckObjects {
+            target_nk630: true,
+            ..objects(&paragraphs)
+        };
+        format_checks(&paragraphs, &objects)
+            .into_iter()
+            .filter_map(|issue| issue.code)
+            .collect()
+    }
+
+    #[test]
+    fn a_heading_without_content_is_e204() {
+        assert!(!codes(&good()).contains(&"E-204"));
+        // 실측: 【도 1】 다음에 그림 없이 【도 2】.
+        let mut rows = good();
+        let at = rows.iter().position(|r| *r == "_").unwrap();
+        rows.remove(at);
+        assert!(codes(&rows).contains(&"E-204"));
+    }
+
+    #[test]
+    fn nk630_heading_pairing_is_checked_only_when_targeted() {
+        // 통특기 2026.11.05 새 서식 짝(배경이 되는 기술 + 해결하려는 과제): 기본 점검은 통과.
+        assert!(!codes(&good()).contains(&"E-244"));
+        // NK-Editor 6.30 을 목표로 하면 같은 원고가 E-244(실측: 「[해결하고자 하는 과제] 태그를 기재하셔야」).
+        assert!(codes_nk630(&good()).contains(&"E-244"));
+        // NK-Editor 6.30 짝(배경이 되는 기술 + 해결하고자 하는 과제)은 통과.
+        let mut rows = good();
+        replace(&mut rows, "【해결하려는 과제】", "【해결하고자 하는 과제】");
+        assert!(!codes_nk630(&rows).contains(&"E-244"));
+        // 옛 짝(배경기술 + 해결하려는 과제)도 통과, 섞은 짝(배경기술 + 해결하고자)은 걸린다.
+        let mut old = good();
+        replace(&mut old, "【발명의 배경이 되는 기술】", "【배경기술】");
+        assert!(!codes_nk630(&old).contains(&"E-244"));
+        replace(&mut old, "【해결하려는 과제】", "【해결하고자 하는 과제】");
+        assert!(codes_nk630(&old).contains(&"E-244"));
     }
 
     fn replace(rows: &mut [&'static str], from: &str, to: &'static str) {
